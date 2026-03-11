@@ -1310,225 +1310,553 @@ async function startAnalysis() {
   renderResults(metrics);
 }
 
-// ─── Real Audio Analysis ───────────────────────────────────────────────────────
+// ─── Real Audio Web Audio API FFT Analysis ────────────────────────────────────
+function computeRealFFT(data, fftSize) {
+  // Hann window + real FFT using OfflineAudioContext approach via manual DIT-FFT
+  const N = fftSize;
+  const re = new Float32Array(N);
+  const im = new Float32Array(N);
+  // Apply Hann window
+  for (let i = 0; i < N && i < data.length; i++) {
+    const w = 0.5 * (1 - Math.cos(2 * Math.PI * i / (N - 1)));
+    re[i] = (data[i] || 0) * w;
+  }
+  // Cooley-Tukey FFT
+  let j = 0;
+  for (let i = 1; i < N; i++) {
+    let bit = N >> 1;
+    for (; j & bit; bit >>= 1) j ^= bit;
+    j ^= bit;
+    if (i < j) {
+      [re[i], re[j]] = [re[j], re[i]];
+      [im[i], im[j]] = [im[j], im[i]];
+    }
+  }
+  for (let len = 2; len <= N; len <<= 1) {
+    const ang = -2 * Math.PI / len;
+    const wRe = Math.cos(ang), wIm = Math.sin(ang);
+    for (let i = 0; i < N; i += len) {
+      let curRe = 1, curIm = 0;
+      for (let k = 0; k < len / 2; k++) {
+        const uRe = re[i+k], uIm = im[i+k];
+        const vRe = re[i+k+len/2]*curRe - im[i+k+len/2]*curIm;
+        const vIm = re[i+k+len/2]*curIm + im[i+k+len/2]*curRe;
+        re[i+k] = uRe+vRe; im[i+k] = uIm+vIm;
+        re[i+k+len/2] = uRe-vRe; im[i+k+len/2] = uIm-vIm;
+        const tmpRe = curRe*wRe - curIm*wIm;
+        curIm = curRe*wIm + curIm*wRe; curRe = tmpRe;
+      }
+    }
+  }
+  const mag = new Float32Array(N / 2);
+  for (let i = 0; i < N / 2; i++) mag[i] = Math.sqrt(re[i]*re[i] + im[i]*im[i]) / N;
+  return mag;
+}
+
+// ─── Spectral Flatness (Wiener Entropy) — key TTS detector ───────────────────
+function spectralFlatness(mag) {
+  let logSum = 0, linSum = 0, count = 0;
+  for (let i = 1; i < mag.length; i++) {
+    if (mag[i] > 1e-10) { logSum += Math.log(mag[i]); linSum += mag[i]; count++; }
+  }
+  if (count === 0) return 0;
+  return Math.exp(logSum / count) / (linSum / count); // 0=tonal/TTS, 1=noise/natural
+}
+
+// ─── Harmonic-to-Noise Ratio ──────────────────────────────────────────────────
+function computeHNR(data, sampleRate, f0) {
+  if (f0 <= 0) return 0;
+  const period = Math.round(sampleRate / f0);
+  if (period >= data.length / 2) return 0;
+  let signalPow = 0, noisePow = 0;
+  const N = Math.min(data.length - period, 4000);
+  for (let i = 0; i < N; i++) {
+    const diff = data[i] - data[i + period];
+    noisePow += diff * diff;
+    signalPow += data[i] * data[i] * 2;
+  }
+  if (noisePow < 1e-12) return 40;
+  const ratio = signalPow / noisePow;
+  return Math.max(0, Math.min(40, 10 * Math.log10(ratio + 1e-10)));
+}
+
+// ─── Spectral Roll-off ────────────────────────────────────────────────────────
+function spectralRolloff(mag, sampleRate, threshold = 0.85) {
+  const total = mag.reduce((a, b) => a + b, 0);
+  let cum = 0;
+  for (let i = 0; i < mag.length; i++) {
+    cum += mag[i];
+    if (cum >= total * threshold) return (i / mag.length) * (sampleRate / 2);
+  }
+  return sampleRate / 2;
+}
+
+// ─── Micro-jitter (pitch irregularity) — humans have it, TTS often too smooth ─
+function computeJitter(data, sampleRate, f0) {
+  if (f0 <= 0) return 0;
+  const minP = Math.floor(sampleRate / (f0 * 1.5));
+  const maxP = Math.floor(sampleRate / (f0 * 0.7));
+  const periods = [];
+  let i = 0;
+  while (i + maxP < Math.min(data.length, sampleRate * 2)) {
+    let bestCorr = -1, bestP = 0;
+    for (let p = minP; p <= maxP; p++) {
+      let c = 0;
+      for (let k = 0; k < p && i + k + p < data.length; k++) c += data[i+k] * data[i+k+p];
+      if (c > bestCorr) { bestCorr = c; bestP = p; }
+    }
+    if (bestP > 0) periods.push(bestP);
+    i += bestP || Math.round(sampleRate / f0);
+  }
+  if (periods.length < 3) return 0;
+  let jitterSum = 0;
+  for (let k = 1; k < periods.length; k++) jitterSum += Math.abs(periods[k] - periods[k-1]);
+  const meanP = periods.reduce((a,b)=>a+b,0)/periods.length;
+  return (jitterSum / (periods.length - 1)) / meanP; // relative jitter
+}
+
+// ─── Silence Entropy — TTS silence is unnaturally clean ──────────────────────
+function silenceEntropy(data, windowSize = 1024) {
+  const energies = [];
+  for (let i = 0; i < data.length - windowSize; i += windowSize) {
+    let e = 0;
+    for (let k = 0; k < windowSize; k++) e += data[i+k]*data[i+k];
+    energies.push(e / windowSize);
+  }
+  if (energies.length < 2) return 0;
+  const silentWindows = energies.filter(e => e < 0.0001);
+  if (silentWindows.length === 0) return 1;
+  // Variance of silent window energies — TTS has near-zero variance (unnaturally quiet)
+  const mean = silentWindows.reduce((a,b)=>a+b,0)/silentWindows.length;
+  const variance = silentWindows.reduce((a,b)=>a+(b-mean)**2,0)/silentWindows.length;
+  return Math.min(1, variance * 10000); // high = natural, low = synthetic
+}
+
+// ─── Spectral Continuity — TTS often has abrupt spectral changes ──────────────
+function spectralContinuity(data, sampleRate) {
+  const fftSize = 512;
+  const hop = 256;
+  const frames = [];
+  for (let i = 0; i + fftSize < Math.min(data.length, sampleRate * 3); i += hop) {
+    const frame = data.slice(i, i + fftSize);
+    const mag = computeRealFFT(frame, fftSize);
+    frames.push(mag);
+  }
+  if (frames.length < 2) return 0.5;
+  let totalFlux = 0;
+  for (let f = 1; f < frames.length; f++) {
+    let flux = 0;
+    for (let b = 0; b < frames[f].length; b++) {
+      const diff = frames[f][b] - frames[f-1][b];
+      flux += diff * diff;
+    }
+    totalFlux += Math.sqrt(flux);
+  }
+  const avgFlux = totalFlux / (frames.length - 1);
+  // Natural speech has moderate flux; TTS can be too smooth or have abrupt cuts
+  // Normalize: very low flux (<0.001) = TTS, very high = noise
+  return Math.min(1, Math.max(0, (avgFlux - 0.0002) / 0.005));
+}
+
+// ─── Energy Envelope Naturalness ──────────────────────────────────────────────
+function envelopeNaturalness(data, sampleRate) {
+  const frameSize = Math.round(sampleRate * 0.02); // 20ms frames
+  const energies = [];
+  for (let i = 0; i + frameSize < data.length; i += frameSize) {
+    let e = 0;
+    for (let k = 0; k < frameSize; k++) e += data[i+k]*data[i+k];
+    energies.push(Math.sqrt(e / frameSize));
+  }
+  if (energies.length < 5) return 50;
+  // Natural speech has smooth energy transitions; compute rate of change
+  let smoothChange = 0;
+  for (let i = 2; i < energies.length - 2; i++) {
+    const rate = Math.abs(energies[i] - energies[i-1]);
+    const prevRate = Math.abs(energies[i-1] - energies[i-2]);
+    smoothChange += Math.abs(rate - prevRate);
+  }
+  const avgSmooth = smoothChange / energies.length;
+  // Too smooth (TTS) or too erratic — both suspicious
+  const normalizedSmooth = Math.min(1, avgSmooth / 0.005);
+  return normalizedSmooth; // 0 = unnaturally flat, 1 = natural
+}
+
+// ─── Autocorrelation pitch with voiced/unvoiced detection ─────────────────────
+function estimateF0(data, sampleRate) {
+  const minPeriod = Math.floor(sampleRate / 500);
+  const maxPeriod = Math.floor(sampleRate / 70);
+  const N = Math.min(data.length, 2048);
+  // Normalize
+  let maxAbs = 0;
+  for (let i = 0; i < N; i++) if (Math.abs(data[i]) > maxAbs) maxAbs = Math.abs(data[i]);
+  if (maxAbs < 0.001) return 0;
+  // AMDF (Average Magnitude Difference Function) — more robust
+  let bestAMDF = Infinity, bestPeriod = 0;
+  for (let p = minPeriod; p <= maxPeriod; p++) {
+    let amdf = 0;
+    for (let i = 0; i < N - p; i++) amdf += Math.abs(data[i] - data[i + p]);
+    amdf /= (N - p);
+    if (amdf < bestAMDF) { bestAMDF = amdf; bestPeriod = p; }
+  }
+  // Only return if strong periodicity
+  return (bestAMDF < 0.15 && bestPeriod > 0) ? sampleRate / bestPeriod : 0;
+}
+
+// ─── Frequency band energy ────────────────────────────────────────────────────
+function getFreqBands(mag, sampleRate) {
+  const binHz = (sampleRate / 2) / mag.length;
+  let sub=0, low=0, mid=0, high=0, ultra=0;
+  for (let k = 0; k < mag.length; k++) {
+    const f = k * binHz, v = mag[k] * mag[k];
+    if (f < 80) sub += v;
+    else if (f < 300) low += v;
+    else if (f < 3400) mid += v;
+    else if (f < 8000) high += v;
+    else ultra += v;
+  }
+  return {
+    sub: Math.sqrt(sub), low: Math.sqrt(low), mid: Math.sqrt(mid),
+    high: Math.sqrt(high), ultra: Math.sqrt(ultra)
+  };
+}
+
+// ─── Main Analysis Function ────────────────────────────────────────────────────
 function analyzeAudio(buffer, file) {
-  const data = buffer.getChannelData(0);
+  const rawData = buffer.getChannelData(0);
   const sampleRate = buffer.sampleRate;
   const duration = buffer.duration;
   const numChannels = buffer.numberOfChannels;
 
-  // --- RMS / Energy ---
-  let rms = 0;
-  for (let i = 0; i < data.length; i++) rms += data[i] * data[i];
-  rms = Math.sqrt(rms / data.length);
-  const rmsDb = 20 * Math.log10(rms + 1e-10);
+  // Use meaningful chunk — skip first 0.1s (file header artifacts)
+  const startSample = Math.floor(sampleRate * 0.1);
+  const data = rawData.slice(startSample);
 
-  // --- Zero Crossing Rate ---
-  let zcr = 0;
-  for (let i = 1; i < data.length; i++) {
-    if ((data[i] >= 0) !== (data[i-1] >= 0)) zcr++;
+  // ── 1. Basic stats ──────────────────────────────────────────────────────────
+  let rmsSum = 0, peak = 0;
+  for (let i = 0; i < data.length; i++) {
+    rmsSum += data[i]*data[i];
+    if (Math.abs(data[i]) > peak) peak = Math.abs(data[i]);
   }
-  zcr = zcr / (data.length / sampleRate); // ZCR per second
-
-  // --- Silence ratio ---
-  let silentSamples = 0;
-  for (let i = 0; i < data.length; i++) if (Math.abs(data[i]) < 0.01) silentSamples++;
-  const silenceRatio = silentSamples / data.length;
-
-  // --- Clipping detection ---
-  let clipped = 0;
-  for (let i = 0; i < data.length; i++) if (Math.abs(data[i]) > 0.99) clipped++;
-  const clippingRatio = clipped / data.length;
-
-  // --- DC offset ---
-  let sum = 0;
-  for (let i = 0; i < data.length; i++) sum += data[i];
-  const dcOffset = Math.abs(sum / data.length);
-
-  // --- Frequency analysis via FFT-like bins ---
-  const fftSize = 2048;
-  const spectrum = computeSpectrum(data.slice(0, Math.min(data.length, fftSize * 64)), fftSize);
-  const { lowEnergy, midEnergy, highEnergy, ultraHigh } = getFreqBands(spectrum, sampleRate);
-
-  // --- Fundamental frequency estimation ---
-  const f0 = estimateF0(data.slice(0, Math.min(data.length, sampleRate * 2)), sampleRate);
-
-  // --- Background noise estimate (noise floor) ---
-  const sortedAbs = [...data].map(Math.abs).sort((a,b)=>a-b);
-  const noiseFloor = sortedAbs[Math.floor(sortedAbs.length * 0.05)];
-  const noiseFloorDb = 20 * Math.log10(noiseFloor + 1e-10);
-
-  // --- Dynamic range ---
-  const peak = Math.max(...[...data].map(Math.abs));
+  const rms = Math.sqrt(rmsSum / data.length);
+  const rmsDb = 20 * Math.log10(rms + 1e-10);
   const dynamicRange = 20 * Math.log10((peak + 1e-10) / (rms + 1e-10));
 
-  // --- Bit depth inference ---
-  const uniqueLevels = new Set(data.map(v => Math.round(v * 32767)));
-  const inferredBitDepth = uniqueLevels.size > 30000 ? 16 : uniqueLevels.size > 1000 ? 12 : 8;
+  // ── 2. Zero Crossing Rate ───────────────────────────────────────────────────
+  let zcr = 0;
+  for (let i = 1; i < data.length; i++)
+    if ((data[i] >= 0) !== (data[i-1] >= 0)) zcr++;
+  zcr = zcr / (data.length / sampleRate);
 
-  // --- Phase correlation (stereo) ---
+  // ── 3. Silence ──────────────────────────────────────────────────────────────
+  let silentSamples = 0;
+  for (let i = 0; i < data.length; i++) if (Math.abs(data[i]) < 0.005) silentSamples++;
+  const silenceRatio = silentSamples / data.length;
+
+  // ── 4. Clipping ─────────────────────────────────────────────────────────────
+  let clipped = 0;
+  for (let i = 0; i < data.length; i++) if (Math.abs(data[i]) > 0.995) clipped++;
+  const clippingRatio = clipped / data.length;
+
+  // ── 5. DC Offset ────────────────────────────────────────────────────────────
+  let dcSum = 0;
+  for (let i = 0; i < data.length; i++) dcSum += data[i];
+  const dcOffset = Math.abs(dcSum / data.length);
+
+  // ── 6. Noise floor (5th percentile energy) ──────────────────────────────────
+  const frameSize = 512;
+  const frameEnergies = [];
+  for (let i = 0; i + frameSize < data.length; i += frameSize) {
+    let e = 0;
+    for (let k = 0; k < frameSize; k++) e += data[i+k]*data[i+k];
+    frameEnergies.push(e / frameSize);
+  }
+  frameEnergies.sort((a,b)=>a-b);
+  const noiseFloor = Math.sqrt(frameEnergies[Math.floor(frameEnergies.length * 0.05)] || 1e-10);
+  const noiseFloorDb = 20 * Math.log10(noiseFloor + 1e-10);
+
+  // ── 7. FFT spectrum ──────────────────────────────────────────────────────────
+  const fftSize = 4096;
+  const fftData = data.slice(0, Math.min(data.length, fftSize));
+  const spectrum = computeRealFFT(fftData, fftSize);
+  const bands = getFreqBands(spectrum, sampleRate);
+
+  // ── 8. Spectral Flatness (Wiener entropy) ────────────────────────────────────
+  const sfm = spectralFlatness(spectrum);
+
+  // ── 9. Spectral Roll-off ─────────────────────────────────────────────────────
+  const rolloff = spectralRolloff(spectrum, sampleRate);
+
+  // ── 10. Spectral Centroid ────────────────────────────────────────────────────
+  let centroidNum = 0, centroidDen = 0;
+  for (let i = 0; i < spectrum.length; i++) {
+    const f = i * (sampleRate / 2) / spectrum.length;
+    centroidNum += f * spectrum[i]; centroidDen += spectrum[i];
+  }
+  const spectralCentroid = centroidDen > 0 ? centroidNum / centroidDen : 0;
+
+  // ── 11. Fundamental Frequency ────────────────────────────────────────────────
+  const f0 = estimateF0(data.slice(0, Math.min(data.length, sampleRate * 1.5)), sampleRate);
+
+  // ── 12. HNR ──────────────────────────────────────────────────────────────────
+  const hnr = computeHNR(data.slice(0, Math.min(data.length, sampleRate * 2)), sampleRate, f0);
+
+  // ── 13. Jitter ───────────────────────────────────────────────────────────────
+  const jitter = computeJitter(data.slice(0, Math.min(data.length, sampleRate * 2)), sampleRate, f0);
+
+  // ── 14. Silence Entropy ──────────────────────────────────────────────────────
+  const silEnt = silenceEntropy(data);
+
+  // ── 15. Spectral Continuity (Flux) ───────────────────────────────────────────
+  const specCont = spectralContinuity(data, sampleRate);
+
+  // ── 16. Envelope Naturalness ─────────────────────────────────────────────────
+  const envNat = envelopeNaturalness(data, sampleRate);
+
+  // ── 17. Phase Correlation (stereo) ───────────────────────────────────────────
   let phaseCorr = null;
   if (buffer.numberOfChannels >= 2) {
     const ch2 = buffer.getChannelData(1);
-    let num = 0, d1 = 0, d2 = 0;
-    const N = Math.min(data.length, ch2.length, 10000);
+    let num=0, d1=0, d2=0;
+    const N = Math.min(data.length, ch2.length, 20000);
     for (let i = 0; i < N; i++) {
-      num += data[i] * ch2[i];
-      d1 += data[i] * data[i];
-      d2 += ch2[i] * ch2[i];
+      num += data[i]*ch2[i]; d1+=data[i]*data[i]; d2+=ch2[i]*ch2[i];
     }
-    phaseCorr = num / (Math.sqrt(d1 * d2) + 1e-10);
+    phaseCorr = num / (Math.sqrt(d1*d2) + 1e-10);
   }
 
-  // --- Breathiness detection (high freq noise between harmonics) ---
-  const breathiness = Math.min(1, highEnergy / (midEnergy + 0.01));
+  // ── 18. Inferred Bit Depth ───────────────────────────────────────────────────
+  const sampleN = Math.min(data.length, 50000);
+  const uniqueLevels = new Set();
+  for (let i = 0; i < sampleN; i++) uniqueLevels.add(Math.round(data[i]*32767));
+  const inferredBitDepth = uniqueLevels.size > 50000 ? 24 : uniqueLevels.size > 25000 ? 16 : uniqueLevels.size > 1000 ? 12 : 8;
 
-  // --- Formant-like check ---
-  const formantPresent = midEnergy > 0.01 && f0 > 80 && f0 < 400;
+  // ── 19. High-freq energy ratio (TTS cutoff) ──────────────────────────────────
+  const hfRatio = (bands.high + bands.ultra) / (bands.mid + 0.0001);
 
-  // --- Compute suspicion scores ---
+  // ═══════════════════════════════════════════════════════════════════
+  // SCORING ENGINE — strict, multi-factor
+  // ═══════════════════════════════════════════════════════════════════
   let bioScore = 100;
   let digScore = 100;
-  let aiScore = 100;
+  let aiScore  = 100;
   const flags = [];
+  const ext = file.name.split('.').pop().toLowerCase();
 
-  // Biological checks
-  if (f0 < 50 || f0 > 600 || f0 === 0) {
+  // ── BIO: F0 check ──────────────────────────────────────────────────
+  if (f0 === 0 && duration > 0.5) {
+    bioScore -= 30;
+    flags.push({ sev:'high', title:'No Detectable Pitch', desc:`No fundamental frequency found. Could be non-speech, noise pad, or a synthesized voice without natural pitch variation.` });
+  } else if (f0 > 0 && (f0 < 60 || f0 > 550)) {
     bioScore -= 25;
-    flags.push({ sev: 'high', title: 'Abnormal Fundamental Frequency', desc: `Detected F0 of ${f0.toFixed(0)}Hz is outside the human vocal range (80–600 Hz). May indicate synthetic voice.` });
+    flags.push({ sev:'high', title:`Abnormal Pitch: ${f0.toFixed(0)} Hz`, desc:`Human speech F0 ranges 80–300Hz (female) or 80–180Hz (male). Detected ${f0.toFixed(0)}Hz is outside biological norms.` });
   }
-  if (zcr < 500 || zcr > 12000) {
-    bioScore -= 20;
-    flags.push({ sev: 'med', title: 'Unusual Zero Crossing Rate', desc: `ZCR of ${zcr.toFixed(0)}/s deviates from typical human speech patterns. Possible TTS artifact.` });
+
+  // ── BIO: Jitter ────────────────────────────────────────────────────
+  if (f0 > 0) {
+    if (jitter < 0.004) {
+      bioScore -= 28; aiScore -= 18;
+      flags.push({ sev:'high', title:'Unnatural Pitch Stability (TTS Marker)', desc:`Jitter index of ${(jitter*100).toFixed(3)}% is near-zero. Real human voices have micro-pitch variations (0.3–2%). Machine-perfect smoothness is a strong deepfake indicator.` });
+    } else if (jitter < 0.01) {
+      bioScore -= 14; aiScore -= 8;
+      flags.push({ sev:'med', title:'Low Pitch Jitter — Possibly Synthetic', desc:`Jitter of ${(jitter*100).toFixed(3)}% is below natural human range. May indicate TTS synthesis or pitch-correction.` });
+    } else if (jitter > 0.05) {
+      bioScore -= 10;
+      flags.push({ sev:'low', title:'Excessive Pitch Jitter', desc:`Jitter of ${(jitter*100).toFixed(2)}% is unusually high. May indicate poor recording quality or distortion.` });
+    }
   }
-  if (breathiness < 0.02) {
-    bioScore -= 15;
-    flags.push({ sev: 'med', title: 'Low Breathiness Index', desc: 'Natural human speech contains breath noise between utterances. Absence may indicate TTS synthesis.' });
+
+  // ── BIO: HNR ───────────────────────────────────────────────────────
+  if (f0 > 0) {
+    if (hnr > 28) {
+      bioScore -= 22; aiScore -= 15;
+      flags.push({ sev:'high', title:`Unnaturally High HNR: ${hnr.toFixed(1)} dB (TTS Marker)`, desc:`HNR of ${hnr.toFixed(1)}dB is too clean. Real human voice typically shows 10–22dB due to vocal jitter, shimmer, and breath turbulence. Neural TTS systems produce abnormally clean harmonics — a known deepfake artifact.` });
+    } else if (hnr > 22) {
+      bioScore -= 10; aiScore -= 8;
+      flags.push({ sev:'med', title:`High HNR: ${hnr.toFixed(1)} dB`, desc:`HNR is above typical human range (10–22dB). May indicate TTS synthesis or pitch-cleaned voice.` });
+    } else if (hnr < 3 && duration > 1) {
+      bioScore -= 10;
+      flags.push({ sev:'low', title:'Low HNR — Noisy Recording', desc:`HNR of ${hnr.toFixed(1)}dB indicates a noisy recording environment. May affect analysis accuracy.` });
+    }
   }
-  if (silenceRatio < 0.05 || silenceRatio > 0.6) {
+
+  // ── BIO: Silence Entropy ───────────────────────────────────────────
+  if (silEnt < 0.15 && silenceRatio > 0.05) {
+    bioScore -= 22; aiScore -= 12;
+    flags.push({ sev:'high', title:'Sterile Silence — No Room Noise (TTS Marker)', desc:`Silent segments have near-zero energy variance (entropy: ${silEnt.toFixed(3)}). Real microphone recordings always capture ambient room noise and breath sounds during pauses. Perfectly silent pauses = synthesized audio.` });
+  } else if (silEnt < 0.25 && silenceRatio > 0.05) {
     bioScore -= 10;
-    flags.push({ sev: 'low', title: 'Atypical Silence Distribution', desc: `Silence ratio of ${(silenceRatio*100).toFixed(1)}% is unusual for natural speech (10–40% expected).` });
-  }
-  if (!formantPresent && duration > 1) {
-    bioScore -= 20;
-    flags.push({ sev: 'high', title: 'Missing Formant Structure', desc: 'No clear formant pattern detected in mid-range frequencies. Human vowels always produce characteristic formants.' });
+    flags.push({ sev:'med', title:'Low Pause Entropy', desc:`Pauses are cleaner than expected (entropy: ${silEnt.toFixed(3)}). Natural recordings have audible background noise during speaker pauses.` });
   }
 
-  // Digital integrity checks
-  if (clippingRatio > 0.001) {
-    digScore -= 20;
-    flags.push({ sev: 'med', title: 'Digital Clipping Detected', desc: `${(clippingRatio*100).toFixed(2)}% of samples are clipped. May indicate heavy compression or re-encoding.` });
-  }
-  if (dcOffset > 0.05) {
-    digScore -= 15;
-    flags.push({ sev: 'med', title: 'Significant DC Offset', desc: `DC offset of ${(dcOffset*1000).toFixed(1)}m detected. May indicate low-quality ADC or signal manipulation.` });
-  }
-  if (ultraHigh < 0.001 && sampleRate >= 44100) {
-    digScore -= 20;
-    flags.push({ sev: 'high', title: 'Ultra-High Frequency Rolloff', desc: 'Near-zero energy above 16kHz despite high sample rate. Suggests MP3/AAC lossy encoding or audio synthesis cutoff.' });
-  }
-  if (phaseCorr !== null && Math.abs(phaseCorr) < 0.3) {
-    digScore -= 15;
-    flags.push({ sev: 'med', title: 'Poor Stereo Phase Correlation', desc: `Phase correlation of ${phaseCorr.toFixed(2)} indicates potentially artificial stereo widening or splicing artifacts.` });
-  }
-  if (dynamicRange < 3) {
-    digScore -= 15;
-    flags.push({ sev: 'med', title: 'Over-Compression (Loudness War)', desc: `Dynamic range of ${dynamicRange.toFixed(1)}dB is very low. Heavy limiting may mask edits or splices.` });
+  // ── BIO: Envelope Naturalness ──────────────────────────────────────
+  if (envNat < 0.2) {
+    bioScore -= 18; aiScore -= 10;
+    flags.push({ sev:'high', title:'Flat Energy Envelope (TTS Marker)', desc:`Energy envelope naturalness: ${envNat.toFixed(3)}. Human speech has dynamic amplitude variation — stress, rhythm, emphasis. Unnaturally smooth envelopes are a hallmark of TTS post-processing and waveform generation.` });
+  } else if (envNat < 0.35) {
+    bioScore -= 8;
+    flags.push({ sev:'low', title:'Below-Average Envelope Variation', desc:`Envelope variation score ${envNat.toFixed(3)} — less natural variation than typical human speech.` });
   }
 
-  // AI artifact checks
-  if (highEnergy > 0.3 * midEnergy && midEnergy < 0.01) {
-    aiScore -= 30;
-    flags.push({ sev: 'high', title: 'TTS Frequency Signature', desc: 'Energy distribution matches patterns seen in neural TTS systems (WaveNet, VITS, etc.) — disproportionate high-freq energy.' });
+  // ── BIO: Silence ratio ─────────────────────────────────────────────
+  if (silenceRatio > 0.7) {
+    bioScore -= 10;
+    flags.push({ sev:'low', title:`High Silence Ratio: ${(silenceRatio*100).toFixed(1)}%`, desc:`${(silenceRatio*100).toFixed(1)}% of the audio is silent. Possible non-speech content, padding, or concatenated TTS segments.` });
   }
-  if (zcr > 8000 && rmsDb > -20) {
-    aiScore -= 20;
-    flags.push({ sev: 'med', title: 'Vocoder-Like Spectral Pattern', desc: 'High ZCR combined with strong signal energy suggests voice conversion or vocoder processing.' });
+
+  // ── DIG: Clipping ──────────────────────────────────────────────────
+  if (clippingRatio > 0.005) {
+    digScore -= 25;
+    flags.push({ sev:'high', title:`Severe Clipping: ${(clippingRatio*100).toFixed(2)}%`, desc:`${(clippingRatio*100).toFixed(2)}% of samples are at maximum amplitude. This level of clipping suggests heavy processing, loudness normalization, or deliberate manipulation.` });
+  } else if (clippingRatio > 0.0005) {
+    digScore -= 10;
+    flags.push({ sev:'med', title:`Minor Clipping Detected: ${(clippingRatio*100).toFixed(3)}%`, desc:`Some samples are clipped — may indicate re-encoding or compression processing.` });
   }
-  if (noiseFloorDb > -40 && silenceRatio < 0.1) {
+
+  // ── DIG: DC Offset ─────────────────────────────────────────────────
+  if (dcOffset > 0.02) {
+    digScore -= 15;
+    flags.push({ sev:'med', title:`DC Offset: ${(dcOffset*1000).toFixed(2)} mV`, desc:`Significant DC bias detected. Quality ADCs and audio editors remove DC offset. Presence suggests low-quality hardware or file manipulation.` });
+  }
+
+  // ── DIG: High-freq rolloff (most TTS has hard cutoff at 8kHz or 16kHz) ──
+  if (sampleRate >= 44100) {
+    if (bands.ultra < 0.0005 && bands.high < 0.001) {
+      digScore -= 30; aiScore -= 20;
+      flags.push({ sev:'high', title:'Hard High-Frequency Cutoff (TTS/Codec Marker)', desc:`Near-zero energy above 8kHz despite ${(sampleRate/1000).toFixed(0)}kHz sample rate. TTS engines and heavily compressed audio show this characteristic brick-wall filter pattern.` });
+    } else if (bands.ultra < 0.001) {
+      digScore -= 15;
+      flags.push({ sev:'med', title:'Ultra-High Frequency Rolloff', desc:`Low energy above 16kHz. Possible MP3/AAC encoding artifact or TTS synthesis cutoff. Genuine studio recordings retain ultra-high frequencies.` });
+    }
+  } else if (sampleRate <= 16000) {
+    digScore -= 10;
+    flags.push({ sev:'low', title:`Low Sample Rate: ${(sampleRate/1000).toFixed(0)} kHz`, desc:`${(sampleRate/1000).toFixed(0)}kHz sample rate limits frequency range. Common in phone calls and some TTS systems. Reduces forensic confidence.` });
+  }
+
+  // ── DIG: Dynamic Range ─────────────────────────────────────────────
+  if (dynamicRange < 2) {
+    digScore -= 20;
+    flags.push({ sev:'high', title:`Extreme Over-Compression: ${dynamicRange.toFixed(1)} dB`, desc:`Dynamic range of only ${dynamicRange.toFixed(1)}dB. Audio has been aggressively limited/normalized, which can mask splicing points and AI generation artifacts.` });
+  } else if (dynamicRange < 6) {
+    digScore -= 10;
+    flags.push({ sev:'med', title:`Low Dynamic Range: ${dynamicRange.toFixed(1)} dB`, desc:`Dynamic range is compressed. Heavy normalization may hide edits.` });
+  }
+
+  // ── DIG: Phase correlation ─────────────────────────────────────────
+  if (phaseCorr !== null && phaseCorr < 0.1) {
+    digScore -= 15;
+    flags.push({ sev:'med', title:`Poor Phase Correlation: ${phaseCorr.toFixed(2)}`, desc:`Stereo channels are highly decorrelated (${phaseCorr.toFixed(2)}). Artificial stereo widening or splicing of separately processed channels detected.` });
+  }
+
+  // ── DIG: Lossy codec ───────────────────────────────────────────────
+  if (['mp3','aac','ogg','m4a'].includes(ext)) {
+    digScore -= 8;
+    flags.push({ sev:'low', title:`Lossy Codec: ${ext.toUpperCase()}`, desc:`File uses lossy compression which destroys fine-grained forensic detail. For court-grade evidence always require WAV or FLAC lossless source.` });
+  }
+
+  // ── AI: Spectral Flatness ──────────────────────────────────────────
+  if (sfm < 0.04) {
+    aiScore -= 30; bioScore -= 10;
+    flags.push({ sev:'high', title:`Highly Tonal Spectrum (TTS Signature): SFM=${sfm.toFixed(4)}`, desc:`SFM of ${sfm.toFixed(4)} — spectrum is dominated by narrow harmonic peaks with no broadband noise floor. TTS systems have unnaturally tonal spectra; real voices have SFM > 0.05 from breath turbulence and vocal noise.` });
+  } else if (sfm < 0.08) {
+    aiScore -= 15;
+    flags.push({ sev:'med', title:`Low Spectral Flatness: SFM=${sfm.toFixed(4)}`, desc:`Below-average spectral flatness. Natural speech SFM is typically 0.05–0.25. Lower values suggest possible TTS or heavy processing.` });
+  }
+
+  // ── AI: Spectral continuity ────────────────────────────────────────
+  if (specCont < 0.15) {
+    aiScore -= 22;
+    flags.push({ sev:'high', title:'Unnaturally Smooth Spectral Transitions', desc:`Spectral continuity score: ${specCont.toFixed(3)}. Real speech has natural frame-to-frame spectral variation. Overly smooth transitions indicate TTS neural vocoder output (HiFi-GAN, WaveGrad, etc).` });
+  } else if (specCont < 0.3) {
     aiScore -= 10;
-    flags.push({ sev: 'low', title: 'Elevated Noise Floor', desc: `Noise floor at ${noiseFloorDb.toFixed(1)}dBFS with low silence ratio. Real recordings typically show ambient noise drops during pauses.` });
+    flags.push({ sev:'med', title:'Low Spectral Variation', desc:`Below-average spectral flux (${specCont.toFixed(3)}). Speech may be over-processed or partially synthetic.` });
   }
 
-  // File metadata flags
-  const ext = currentFile.name.split('.').pop().toLowerCase();
-  if (['mp3','aac','ogg'].includes(ext)) {
-    flags.push({ sev: 'info', title: 'Lossy Codec Detected', desc: `File uses ${ext.toUpperCase()} lossy compression. Forensic analysis accuracy is reduced — recommend lossless source (WAV/FLAC) for court-grade evidence.` });
-    digScore -= 5;
+  // ── AI: Spectral centroid anomaly ─────────────────────────────────
+  if (spectralCentroid < 200 && duration > 0.5) {
+    aiScore -= 15;
+    flags.push({ sev:'med', title:`Low Spectral Centroid: ${spectralCentroid.toFixed(0)} Hz`, desc:`Spectral energy is concentrated in very low frequencies. Normal speech centroid is 800–3000Hz. This suggests heavy bass boost, muffled recording, or synthesizer artifact.` });
   }
 
-  // Clamp
-  bioScore = Math.max(0, Math.min(100, bioScore));
-  digScore = Math.max(0, Math.min(100, digScore));
-  aiScore = Math.max(0, Math.min(100, aiScore));
+  // ── POSITIVE AUTHENTICITY SIGNALS ────────────────────────────────
+  // Good jitter = natural human voice
+  if (f0 > 0 && jitter >= 0.004 && jitter <= 0.04) {
+    bioScore = Math.min(100, bioScore + 12);
+    flags.push({ sev:'info', title:'✓ Natural Pitch Jitter Detected', desc:`Jitter of ${(jitter*100).toFixed(3)}% falls within natural human range (0.3–4%). Consistent with authentic biological voice production.` });
+  }
+  // Good SFM = natural voice noise
+  if (sfm >= 0.08 && sfm <= 0.35) {
+    aiScore = Math.min(100, aiScore + 12);
+    flags.push({ sev:'info', title:'✓ Healthy Spectral Noise Floor', desc:`Spectral Flatness ${sfm.toFixed(4)} indicates natural vocal turbulence and breath noise present in the spectrum — a strong authenticity signal.` });
+  }
+  // Real background noise in silences
+  if (silEnt > 0.3 && silenceRatio > 0.05) {
+    bioScore = Math.min(100, bioScore + 10);
+    flags.push({ sev:'info', title:'✓ Natural Ambient Noise in Pauses', desc:`Pauses contain organic acoustic energy (entropy: ${silEnt.toFixed(3)}) consistent with a real microphone in a room. Synthesized audio has dead-silent pauses.` });
+  }
+  // Natural energy variation
+  if (envNat >= 0.35) {
+    bioScore = Math.min(100, bioScore + 8);
+    flags.push({ sev:'info', title:'✓ Natural Prosodic Dynamics', desc:`Energy envelope varies naturally (score: ${envNat.toFixed(3)}). Consistent with organic human speech rhythm, stress and intonation patterns.` });
+  }
+  // Good HNR range
+  if (f0 > 0 && hnr >= 8 && hnr <= 22) {
+    bioScore = Math.min(100, bioScore + 8);
+  }
+  // Full frequency coverage
+  if (bands.ultra > 0.001 && sampleRate >= 44100) {
+    digScore = Math.min(100, digScore + 10);
+    flags.push({ sev:'info', title:'✓ Full Frequency Spectrum Detected', desc:'Audio energy extends to ultra-high frequencies, consistent with genuine wideband recording without artificial cutoff filters.' });
+  }
+  // Good dynamic range
+  if (dynamicRange >= 15) {
+    digScore = Math.min(100, digScore + 8);
+    flags.push({ sev:'info', title:`✓ Healthy Dynamic Range: ${dynamicRange.toFixed(1)} dB`, desc:`${dynamicRange.toFixed(1)}dB dynamic range indicates minimal compression and preservation of natural vocal loudness variation.` });
+  }
+  // Good spectral continuity
+  if (specCont >= 0.4) {
+    aiScore = Math.min(100, aiScore + 10);
+  }
 
-  // Add at least one green flag if all good
+  // ── Clamp all scores ───────────────────────────────────────────────
+  bioScore = Math.max(0, Math.min(100, Math.round(bioScore)));
+  digScore = Math.max(0, Math.min(100, Math.round(digScore)));
+  aiScore  = Math.max(0, Math.min(100, Math.round(aiScore)));
+
+  // Weighted composite
+  const composite = Math.max(0, Math.min(100, Math.round(
+    bioScore * 0.40 + digScore * 0.35 + aiScore * 0.25
+  )));
+
   if (flags.length === 0) {
-    flags.push({ sev: 'info', title: 'No Significant Anomalies Detected', desc: 'All forensic checks passed. The audio exhibits characteristics consistent with authentic human speech recording.' });
+    flags.push({ sev:'info', title:'All Forensic Checks Passed', desc:'No significant anomalies detected. Biological voice signature, digital integrity, and spectral characteristics are all consistent with authentic human speech recording.' });
   }
-
-  const composite = Math.round((bioScore * 0.4 + digScore * 0.35 + aiScore * 0.25));
 
   return {
-    composite, bioScore: Math.round(bioScore), digScore: Math.round(digScore), aiScore: Math.round(aiScore),
+    composite, bioScore, digScore, aiScore,
     metrics: {
-      f0: f0.toFixed(1), rmsDb: rmsDb.toFixed(1), zcr: Math.round(zcr),
-      silenceRatio: (silenceRatio * 100).toFixed(1),
-      clippingRatio: (clippingRatio * 100).toFixed(3),
-      dcOffset: (dcOffset * 1000).toFixed(2),
+      f0: f0 > 0 ? f0.toFixed(1) : 'N/A',
+      rmsDb: rmsDb.toFixed(1),
+      zcr: Math.round(zcr),
+      silenceRatio: (silenceRatio*100).toFixed(1),
+      clippingRatio: (clippingRatio*100).toFixed(4),
+      dcOffset: (dcOffset*1000).toFixed(3),
       noiseFloorDb: noiseFloorDb.toFixed(1),
       dynamicRange: dynamicRange.toFixed(1),
+      hnr: hnr.toFixed(1),
+      jitter: f0 > 0 ? (jitter*100).toFixed(3)+'%' : 'N/A',
+      sfm: sfm.toFixed(4),
+      rolloff: rolloff.toFixed(0)+' Hz',
+      centroid: spectralCentroid.toFixed(0)+' Hz',
+      silEnt: silEnt.toFixed(3),
+      envNat: envNat.toFixed(3),
+      specCont: specCont.toFixed(3),
       sampleRate, duration: duration.toFixed(2), numChannels,
-      inferredBitDepth, breathiness: breathiness.toFixed(3),
+      inferredBitDepth,
       phaseCorr: phaseCorr !== null ? phaseCorr.toFixed(3) : 'N/A (mono)',
-      lowEnergy: lowEnergy.toFixed(4), midEnergy: midEnergy.toFixed(4), highEnergy: highEnergy.toFixed(4),
+      lowEnergy: bands.low.toFixed(5), midEnergy: bands.mid.toFixed(5), highEnergy: bands.high.toFixed(5),
     },
     flags, spectrum
   };
-}
-
-// Simple DFT-based spectrum
-function computeSpectrum(data, N) {
-  N = Math.min(N, data.length);
-  const spectrum = new Float32Array(N / 2);
-  for (let k = 0; k < N / 2; k++) {
-    let re = 0, im = 0;
-    for (let n = 0; n < N; n++) {
-      const angle = 2 * Math.PI * k * n / N;
-      re += (data[n] || 0) * Math.cos(angle);
-      im -= (data[n] || 0) * Math.sin(angle);
-    }
-    spectrum[k] = Math.sqrt(re*re + im*im) / N;
-  }
-  return spectrum;
-}
-
-function getFreqBands(spectrum, sampleRate) {
-  const binHz = (sampleRate / 2) / spectrum.length;
-  let low = 0, mid = 0, high = 0, ultra = 0;
-  for (let k = 0; k < spectrum.length; k++) {
-    const f = k * binHz;
-    const v = spectrum[k] * spectrum[k];
-    if (f < 300) low += v;
-    else if (f < 3000) mid += v;
-    else if (f < 8000) high += v;
-    else ultra += v;
-  }
-  return { lowEnergy: Math.sqrt(low), midEnergy: Math.sqrt(mid), highEnergy: Math.sqrt(high), ultraHigh: Math.sqrt(ultra) };
-}
-
-function estimateF0(data, sampleRate) {
-  // Autocorrelation-based pitch detection
-  const minPeriod = Math.floor(sampleRate / 600);
-  const maxPeriod = Math.floor(sampleRate / 80);
-  const N = Math.min(data.length, 4096);
-  let bestCorr = 0, bestPeriod = 0;
-  for (let p = minPeriod; p <= maxPeriod; p++) {
-    let corr = 0;
-    for (let i = 0; i < N - p; i++) corr += data[i] * data[i + p];
-    if (corr > bestCorr) { bestCorr = corr; bestPeriod = p; }
-  }
-  return bestPeriod > 0 ? sampleRate / bestPeriod : 0;
 }
 
 // ─── Render Results ────────────────────────────────────────────────────────────
@@ -1561,33 +1889,37 @@ function renderResults(m) {
   // Grid panels
   const grid = document.getElementById('resultsGrid');
   grid.innerHTML = '';
+  const f0val = parseFloat(m.metrics.f0) || 0;
+  const jitterVal = parseFloat(m.metrics.jitter) || 0;
+  const hnrVal = parseFloat(m.metrics.hnr);
+  const sfmVal = parseFloat(m.metrics.sfm);
   grid.appendChild(makePanel('bio', 'BIOLOGICAL SIGNATURE', 'Voice Biometrics', m.bioScore, [
-    { name: 'Fundamental Freq (F0)', val: m.metrics.f0 + ' Hz', bar: Math.min(100, (parseFloat(m.metrics.f0)/600)*100), color: parseFloat(m.metrics.f0) > 80 && parseFloat(m.metrics.f0) < 500 ? 'ok' : 'bad' },
-    { name: 'Zero Crossing Rate', val: m.metrics.zcr + '/s', bar: Math.min(100, (m.metrics.zcr/10000)*100), color: m.metrics.zcr > 500 && m.metrics.zcr < 10000 ? 'ok' : 'warn' },
-    { name: 'Breathiness Index', val: m.metrics.breathiness, bar: Math.min(100, parseFloat(m.metrics.breathiness)*500), color: parseFloat(m.metrics.breathiness) > 0.02 ? 'ok' : 'bad' },
-    { name: 'Silence Ratio', val: m.metrics.silenceRatio + '%', bar: parseFloat(m.metrics.silenceRatio), color: 'blue' },
-    { name: 'RMS Level', val: m.metrics.rmsDb + ' dBFS', bar: Math.min(100, Math.max(0, (60+parseFloat(m.metrics.rmsDb))/60*100)), color: 'blue' },
+    { name: 'Fundamental Freq (F0)', val: m.metrics.f0 + (f0val>0?' Hz':''), bar: Math.min(100,(f0val/400)*100), color: f0val>70&&f0val<450?'ok':f0val>0?'warn':'bad' },
+    { name: 'HNR (Harmonics/Noise)', val: m.metrics.hnr + ' dB', bar: Math.min(100,(hnrVal/40)*100), color: hnrVal>35?'bad':hnrVal>8?'ok':'warn' },
+    { name: 'Pitch Jitter', val: m.metrics.jitter, bar: Math.min(100, jitterVal*30), color: jitterVal>0.05&&jitterVal<5?'ok':jitterVal<0.05&&jitterVal>0?'bad':'warn' },
+    { name: 'Silence Entropy', val: m.metrics.silEnt, bar: Math.min(100, parseFloat(m.metrics.silEnt)*200), color: parseFloat(m.metrics.silEnt)>0.1?'ok':'bad' },
+    { name: 'Envelope Naturalness', val: m.metrics.envNat, bar: Math.min(100, parseFloat(m.metrics.envNat)*100), color: parseFloat(m.metrics.envNat)>0.15?'ok':'bad' },
   ]));
   grid.appendChild(makePanel('dig', 'DIGITAL INTEGRITY', 'File & Signal Forensics', m.digScore, [
-    { name: 'Clipping Ratio', val: m.metrics.clippingRatio + '%', bar: Math.min(100, parseFloat(m.metrics.clippingRatio)*100), color: parseFloat(m.metrics.clippingRatio) < 0.01 ? 'ok' : 'bad' },
-    { name: 'DC Offset', val: m.metrics.dcOffset + ' mV', bar: Math.min(100, parseFloat(m.metrics.dcOffset)*5), color: parseFloat(m.metrics.dcOffset) < 10 ? 'ok' : 'warn' },
-    { name: 'Noise Floor', val: m.metrics.noiseFloorDb + ' dBFS', bar: Math.min(100, Math.max(0,(80+parseFloat(m.metrics.noiseFloorDb))/80*100)), color: 'blue' },
-    { name: 'Dynamic Range', val: m.metrics.dynamicRange + ' dB', bar: Math.min(100, parseFloat(m.metrics.dynamicRange)*4), color: parseFloat(m.metrics.dynamicRange) > 10 ? 'ok' : 'warn' },
-    { name: 'Phase Correlation', val: m.metrics.phaseCorr, bar: Math.min(100, Math.abs(parseFloat(m.metrics.phaseCorr) || 1)*100), color: 'blue' },
+    { name: 'Clipping Ratio', val: m.metrics.clippingRatio + '%', bar: Math.min(100, parseFloat(m.metrics.clippingRatio)*500), color: parseFloat(m.metrics.clippingRatio)<0.001?'ok':parseFloat(m.metrics.clippingRatio)<0.01?'warn':'bad' },
+    { name: 'Dynamic Range', val: m.metrics.dynamicRange + ' dB', bar: Math.min(100, parseFloat(m.metrics.dynamicRange)*4), color: parseFloat(m.metrics.dynamicRange)>10?'ok':parseFloat(m.metrics.dynamicRange)>6?'warn':'bad' },
+    { name: 'Noise Floor', val: m.metrics.noiseFloorDb + ' dBFS', bar: Math.min(100,Math.max(0,(80+parseFloat(m.metrics.noiseFloorDb))/80*100)), color: 'blue' },
+    { name: 'DC Offset', val: m.metrics.dcOffset + ' mV', bar: Math.min(100, parseFloat(m.metrics.dcOffset)*2), color: parseFloat(m.metrics.dcOffset)<5?'ok':parseFloat(m.metrics.dcOffset)<20?'warn':'bad' },
+    { name: 'Phase Correlation', val: m.metrics.phaseCorr, bar: m.metrics.phaseCorr!=='N/A (mono)'?Math.min(100,Math.abs(parseFloat(m.metrics.phaseCorr))*100):50, color: 'blue' },
   ]));
   grid.appendChild(makePanel('ai', 'AI ARTIFACT SCAN', 'Synthetic Voice Detection', m.aiScore, [
-    { name: 'Low Freq Energy', val: m.metrics.lowEnergy, bar: Math.min(100, parseFloat(m.metrics.lowEnergy)*1000), color: 'blue' },
-    { name: 'Mid Freq Energy', val: m.metrics.midEnergy, bar: Math.min(100, parseFloat(m.metrics.midEnergy)*500), color: 'ok' },
-    { name: 'High Freq Energy', val: m.metrics.highEnergy, bar: Math.min(100, parseFloat(m.metrics.highEnergy)*2000), color: 'warn' },
-    { name: 'Inferred Bit Depth', val: m.metrics.inferredBitDepth + '-bit', bar: (m.metrics.inferredBitDepth/16)*100, color: m.metrics.inferredBitDepth >= 16 ? 'ok' : 'warn' },
-    { name: 'Sample Rate', val: (m.metrics.sampleRate/1000).toFixed(1) + ' kHz', bar: Math.min(100,(m.metrics.sampleRate/48000)*100), color: 'blue' },
+    { name: 'Spectral Flatness (SFM)', val: m.metrics.sfm, bar: Math.min(100, sfmVal*400), color: sfmVal>0.06?'ok':sfmVal>0.02?'warn':'bad' },
+    { name: 'Spectral Continuity', val: m.metrics.specCont, bar: Math.min(100, parseFloat(m.metrics.specCont)*100), color: parseFloat(m.metrics.specCont)>0.1?'ok':'bad' },
+    { name: 'Spectral Centroid', val: m.metrics.centroid, bar: Math.min(100,(parseFloat(m.metrics.centroid)/4000)*100), color: parseFloat(m.metrics.centroid)>500?'ok':'warn' },
+    { name: 'Spectral Roll-off', val: m.metrics.rolloff, bar: Math.min(100,(parseFloat(m.metrics.rolloff)/(m.metrics.sampleRate/2))*100), color: parseFloat(m.metrics.rolloff)>3000?'ok':'warn' },
+    { name: 'Mid-band Energy', val: m.metrics.midEnergy, bar: Math.min(100, parseFloat(m.metrics.midEnergy)*2000), color: 'blue' },
   ]));
   grid.appendChild(makePanel('meta', 'FILE METADATA', 'Source Provenance', Math.round((m.bioScore+m.digScore)/2), [
     { name: 'Duration', val: m.metrics.duration + 's', bar: Math.min(100,(parseFloat(m.metrics.duration)/60)*100), color: 'blue' },
-    { name: 'Channels', val: m.metrics.numChannels + (m.metrics.numChannels===1?' (Mono)':' (Stereo)'), bar: (m.metrics.numChannels/2)*100, color: 'blue' },
-    { name: 'File Size', val: formatBytes(currentFile.size), bar: 50, color: 'blue' },
-    { name: 'Format', val: currentFile.name.split('.').pop().toUpperCase(), bar: 50, color: 'blue' },
-    { name: 'Last Modified', val: new Date(currentFile.lastModified).toLocaleDateString(), bar: 50, color: 'blue' },
+    { name: 'Sample Rate', val: (m.metrics.sampleRate/1000).toFixed(1)+' kHz', bar: Math.min(100,(m.metrics.sampleRate/48000)*100), color: m.metrics.sampleRate>=44100?'ok':'warn' },
+    { name: 'Channels', val: m.metrics.numChannels+(m.metrics.numChannels===1?' (Mono)':' (Stereo)'), bar: (m.metrics.numChannels/2)*100, color: 'blue' },
+    { name: 'Format', val: currentFile.name.split('.').pop().toUpperCase(), bar: 50, color: ['wav','flac'].includes(currentFile.name.split('.').pop().toLowerCase())?'ok':'warn' },
+    { name: 'Inferred Bit Depth', val: m.metrics.inferredBitDepth+'-bit', bar: (m.metrics.inferredBitDepth/24)*100, color: m.metrics.inferredBitDepth>=16?'ok':'warn' },
   ]));
 
   // Spectrogram
